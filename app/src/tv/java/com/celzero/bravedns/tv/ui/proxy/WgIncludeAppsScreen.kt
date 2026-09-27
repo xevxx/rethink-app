@@ -136,7 +136,7 @@ fun WgIncludeAppsScreen(configId: Int, navController: NavController? = null) {
         }
     }
 
-    val rows = remember(allApps, proxyId) {
+    val rows = remember(allApps, proxyId, reloadKey) {
         allApps
             .map { app ->
                 WgAppRow(

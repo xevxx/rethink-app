@@ -9,10 +9,12 @@
  */
 package com.celzero.bravedns.tv.ui.proxy
 
+import android.app.Activity
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -28,6 +30,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -52,8 +55,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.StringReader
+import java.nio.charset.StandardCharsets
 import androidx.compose.material3.Text as M3Text
 
 /**
@@ -73,9 +78,9 @@ import androidx.compose.material3.Text as M3Text
  *  * Optional name field — defaults to upstream's `${WG}{id}`.
  *
  * SAF flow:
- *  * Tap "Open .conf file" — fires an `ACTION_OPEN_DOCUMENT` intent.
- *    The TV-side Files app fulfills it and returns a content URI we
- *    open via `ContentResolver`.
+ *  * Tap "Open .conf file" — fires an `ACTION_GET_CONTENT` chooser.
+ *    This lets users select an installed, remote-friendly file manager
+ *    instead of forcing the phone-oriented system DocumentsUI.
  *
  * Save calls `addConfig(parsed, name)`. On success we pop back to
  * Proxy; on parse / save error we render the message inline.
@@ -90,19 +95,53 @@ fun WgImportScreen(navController: NavController? = null) {
     var configText by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
+    var openingFile by remember { mutableStateOf(false) }
+    var loadedFileName by remember { mutableStateOf<String?>(null) }
+
+    // Material text fields do not inherit the TV Material color scheme. Supply
+    // the TV colors explicitly so text remains legible on the dark TV surface.
+    val textFieldColors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = MaterialTheme.colorScheme.onSurface,
+        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+        disabledTextColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f),
+        errorTextColor = MaterialTheme.colorScheme.onSurface,
+        cursorColor = MaterialTheme.colorScheme.primary,
+        errorCursorColor = MaterialTheme.colorScheme.error,
+        focusedBorderColor = MaterialTheme.colorScheme.primary,
+        unfocusedBorderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        disabledBorderColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+        errorBorderColor = MaterialTheme.colorScheme.error,
+        focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        disabledPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+        errorPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 
     val openDocLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-    ) { uri: Uri? ->
-        uri ?: return@rememberLauncherForActivityResult
-        scope.launch(Dispatchers.IO) {
-            error = null
-            try {
-                val text = readUri(context, uri)
-                withContext(Dispatchers.Main) { configText = text }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { error = e.message ?: "Could not read file" }
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val uri = result.data?.data.takeIf { result.resultCode == Activity.RESULT_OK }
+        if (uri == null) {
+            openingFile = false
+            return@rememberLauncherForActivityResult
+        }
+
+        error = null
+        loadedFileName = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { readTunnelFile(context, uri) }
             }
+            result.onSuccess { file ->
+                configText = file.contents
+                if (tunnelName.isBlank()) {
+                    tunnelName = file.name.removeSuffix(".conf")
+                }
+                loadedFileName = file.name
+            }.onFailure { cause ->
+                error = "Could not open tunnel file: ${cause.message ?: "unknown error"}"
+            }
+            openingFile = false
         }
     }
 
@@ -126,21 +165,33 @@ fun WgImportScreen(navController: NavController? = null) {
                         if (pasted.isNotBlank()) {
                             configText = pasted
                             error = null
+                            loadedFileName = null
                         } else {
                             error = "Clipboard is empty or not text."
                         }
                     },
                 )
                 SecondaryButton(
-                    label = "Open .conf file",
+                    label = if (openingFile) "Opening…" else "Open .conf file",
                     onClick = {
-                        // Accept */* because the WireGuard MIME isn't
-                        // standardised — letting the user pick any file
-                        // and parsing the contents is more reliable on
-                        // TV than filtering by extension.
+                        if (openingFile) return@SecondaryButton
+                        // GET_CONTENT allows installed file managers to
+                        // participate, unlike OPEN_DOCUMENT which routes
+                        // directly through the system DocumentsUI.
+                        openingFile = true
+                        error = null
+                        loadedFileName = null
                         runCatching {
-                            openDocLauncher.launch(arrayOf("*/*"))
+                            val fileIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                                addCategory(Intent.CATEGORY_OPENABLE)
+                                type = "*/*"
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            openDocLauncher.launch(
+                                Intent.createChooser(fileIntent, "Choose a file manager"),
+                            )
                         }.onFailure {
+                            openingFile = false
                             error = "No file picker available on this device."
                         }
                     },
@@ -151,6 +202,7 @@ fun WgImportScreen(navController: NavController? = null) {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 M3Text(
                     text = "Tunnel name (optional)",
+                    color = MaterialTheme.colorScheme.onSurface,
                     style = MaterialTheme.typography.titleSmall.copy(
                         fontWeight = FontWeight.SemiBold,
                     ),
@@ -160,6 +212,7 @@ fun WgImportScreen(navController: NavController? = null) {
                     onValueChange = { tunnelName = it },
                     placeholder = { M3Text("e.g. mullvad-us-nyc") },
                     singleLine = true,
+                    colors = textFieldColors,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
@@ -167,6 +220,7 @@ fun WgImportScreen(navController: NavController? = null) {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 M3Text(
                     text = "Tunnel configuration",
+                    color = MaterialTheme.colorScheme.onSurface,
                     style = MaterialTheme.typography.titleSmall.copy(
                         fontWeight = FontWeight.SemiBold,
                     ),
@@ -179,9 +233,18 @@ fun WgImportScreen(navController: NavController? = null) {
                             "[Interface]\nPrivateKey = …\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = …\nEndpoint = host:port\nAllowedIPs = 0.0.0.0/0",
                         )
                     },
+                    colors = textFieldColors,
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 220.dp, max = 360.dp),
+                )
+            }
+
+            loadedFileName?.let { fileName ->
+                M3Text(
+                    text = "Loaded $fileName. Review it, then select Import tunnel.",
+                    color = MaterialTheme.colorScheme.onSurface,
+                    style = MaterialTheme.typography.bodyMedium,
                 )
             }
 
@@ -230,10 +293,35 @@ fun WgImportScreen(navController: NavController? = null) {
     }
 }
 
-private fun readUri(context: Context, uri: Uri): String {
-    context.contentResolver.openInputStream(uri).use { stream ->
-        return BufferedReader(InputStreamReader(stream)).readText()
+private data class TunnelFile(val name: String, val contents: String)
+
+private fun readTunnelFile(context: Context, uri: Uri): TunnelFile {
+    val resolver = context.contentResolver
+    runCatching {
+        resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
+
+    val name = resolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME),
+        null,
+        null,
+        null,
+    )?.use { cursor ->
+        if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+    } ?: Uri.decode(uri.lastPathSegment).orEmpty().substringAfterLast('/').ifBlank {
+        "tunnel.conf"
+    }
+
+    val contents = resolver.openInputStream(uri)?.use { stream ->
+        BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8)).readText()
+    } ?: throw IOException("The file provider returned no data")
+
+    if (contents.isBlank()) {
+        throw IOException("The selected file is empty")
+    }
+
+    return TunnelFile(name = name, contents = contents)
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
